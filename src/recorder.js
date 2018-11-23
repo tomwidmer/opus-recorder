@@ -26,8 +26,11 @@ var Recorder = function( config ){
     recordingGain: 1,
     resampleQuality: 3,
     streamPages: false,
+    reuseEncoder: false,
     wavBitDepth: 16,
   }, config );
+
+  this.encodedSamplePosition = 0;
 };
 
 
@@ -121,40 +124,84 @@ Recorder.prototype.initSourceNode = function( sourceNode ){
   });
 };
 
-Recorder.prototype.initWorker = function(){
-  var onPage = (this.config.streamPages ? this.streamPage : this.storePage).bind(this);
-
-  this.recordedPages = [];
-  this.totalLength = 0;
-  this.encoder =  new global.Worker(this.config.encoderPath);
+Recorder.prototype.loadWorker = function() {
+  if ( this.config.reuseEncoder && this.encoder) {
+    return Promise.resolve();
+  }
+  if ( this.encoder ) {
+    this.encoder.terminate();
+  }
+  this.encoder = new global.Worker(this.config.encoderPath);
 
   return new Promise((resolve, reject) => {
-    this.encoder.addEventListener( "message", (e) => {
-      switch( e['data']['message'] ){
-        case 'ready':
-          resolve();
-          break;
-        case 'page':
-          onPage(e['data']['page']);
-          break;
-        case 'done':
-          this.finish();
-          break;
+    var onloaded = (e) => {
+      this.encoder.removeEventListener( "message", onloaded );
+      console.log(e);
+      if ( e['data']['message'] === 'pong' ) {
+        resolve();
       }
-    });
+
+      else {
+        reject(new Error("Unexpected event"));
+      }
+    };
+    this.encoder.addEventListener( "message", onloaded );
+    this.encoder.postMessage( { command: "ping" } );
+  });
+};
+
+Recorder.prototype.initWorker = function(){
+  return this.loadWorker().then( () => {
+    this.recordedPages = [];
+    this.totalLength = 0;
 
     this.encoder.postMessage( Object.assign({
       command: 'init',
       originalSampleRate: this.audioContext.sampleRate,
       wavSampleRate: this.audioContext.sampleRate
     }, this.config));
+    var onPage = (this.config.streamPages ? this.streamPage : this.storePage).bind(this);
+
+    return new Promise((resolve, reject) => {
+      var callback = (e) => {
+        switch( e['data']['message'] ){
+          case 'ready':
+            resolve();
+            break;
+          case 'page':
+            this.encodedSamplePosition = e['data']['samplePosition'];
+            onPage(e['data']['page']);
+            break;
+          case 'done':
+            this.encoder.removeEventListener( "message", callback );
+            callback = undefined;
+            this.finish();
+            break;
+        }
+      };
+      this.encoder.addEventListener( "message", callback);
+    });
   });
 };
 
-Recorder.prototype.pause = function(){
-  if ( this.state === "recording" ){
+Recorder.prototype.pause = function( flush ) {
+  if ( this.state === "recording" ) {
     this.state = "paused";
+    if ( flush ) {
+      return new Promise((resolve, reject) => {
+        const callback = (e) => {
+          if ( e["data"]["message"] === 'flush' ) {
+            this.encoder.removeEventListener( "message", callback );
+            this.onpause();
+            resolve();
+          }
+        };
+        this.encoder.addEventListener( "message", callback );
+        this.encoder.postMessage( { command: "flush" } );
+      });
+    }
     this.onpause();
+    return Promise.resolve();
   }
 };
 
@@ -186,6 +233,8 @@ Recorder.prototype.start = function( sourceNode ){
     this.initAudioContext( sourceNode );
     this.initAudioGraph();
 
+    this.encodedSamplePosition = 0;
+
     return Promise.all([this.initSourceNode(sourceNode), this.initWorker()]).then((results) => {
       this.sourceNode = results[0];
       this.state = "recording";
@@ -205,6 +254,24 @@ Recorder.prototype.stop = function(){
     this.sourceNode.disconnect();
     this.clearStream();
     this.encoder.postMessage({ command: "done" });
+
+    if (!this.config.reuseEncoder) {
+      this.encoder.postMessage({ command: "close" });
+    }
+
+    return new Promise((resolve) => {
+      this._finished = resolve;
+    });
+  }
+  return Promise.resolve();
+};
+
+Recorder.prototype.destroy = function(){
+  if ( this.state === "inactive" ) {
+    if (this.encoder) {
+      this.encoder.postMessage({command: "close"});
+      delete this.encoder;
+    }
   }
 };
 
@@ -228,6 +295,14 @@ Recorder.prototype.finish = function() {
     this.ondataavailable( outputData );
   }
   this.onstop();
+  if ( this._finished ) {
+    this._finished();
+    delete this._finished;
+  }
+
+  if (!this.config.reuseEncoder) {
+    delete this.encoder;
+  }
 };
 
 
